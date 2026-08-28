@@ -3,6 +3,7 @@
 // Zo blijft je API-sleutel geheim (server-side env var) en zijn er geen CORS-problemen.
 //
 // Vereist: een omgevingsvariabele ANTHROPIC_API_KEY in je Cloudflare Pages-project.
+// Voor de Notion-uitvoer: NOTION_TOKEN + NOTION_INBOX_DS_ID.
 
 const MODEL = 'claude-sonnet-5';   // geldig, actueel model-ID (datumloos = vaste snapshot sinds 4.6). Wisselbaar naar 'claude-haiku-4-5' voor sneller/goedkoper.
 const MAX_TOKENS = 2000;           // ruim genoeg voor een lang vergaderverslag
@@ -31,6 +32,7 @@ Antwoord UITSLUITEND als geldig JSON zonder markdown of uitleg:
     { "omschrijving": "...", "houder": "Yannick of andere naam", "deadline": "YYYY-MM-DD of null", "prioriteit": "hoog/normaal/laag", "project": "meest waarschijnlijke projectnaam of null" }
   ],
   "vergadering": {
+    "titel": "korte titel van de vergadering (max 8 woorden) of null",
     "datum": "YYYY-MM-DD of null",
     "locatie": "of null",
     "aanwezigen": [],
@@ -48,6 +50,7 @@ Inhoudelijke regels:
 - Extraheer ALLE actiepunten, ook impliciete taken.
 - Als geen houder vermeld => gebruik "Yannick".
 - Vul bij elk actiepunt 'project' in: je beste gok van de projectnaam waartoe het hoort (vrije tekst, geen ID). Ken je het niet => null.
+- Bij een vergadering: vul 'vergadering.beslissingen' met alle genomen beslissingen (elk als losse korte zin), 'aanwezigen' met de vermelde namen, en 'titel' met een korte omschrijving van de vergadering.
 - Datums (deadline, vergaderdatum) ALTIJD als YYYY-MM-DD (ISO). Reken relatieve datums ("volgende week", "maandag") NIET om als je de opnamedatum niet kent => gebruik dan null en laat het in de omschrijving staan.
 - Spreek de gebruiker aan met "je/jij" in de samenvatting.
 
@@ -79,13 +82,16 @@ export function onRequestOptions() {
   });
 }
 
-// ── Notion Inbox (triage-stap) ─────────────────────────────────────────────
+// ── Notion (triage-Inbox + Vergaderingen) ──────────────────────────────────
 // Elke opname landt als losse rijen in de Inbox-data source op status
 // "Te bevestigen". Yannick triageert daar later; een foute classificatie raakt
-// zo nooit de echte data. Werkt op het data-sources-model (versie 2025-09-03)
-// en schrijft naar een data_source_id, niet naar een database_id.
+// zo nooit de echte data. Bij een vergadering wordt bovendien een echt record
+// in 📅 Vergaderingen aangemaakt (met beslissingen + ruw verslag) en worden de
+// actiepunten daaraan gekoppeld. Werkt op het data-sources-model (2025-09-03).
 const NOTION_VERSION = '2025-09-03';
 const INBOX_STATUS = 'Te bevestigen';
+// Data source-ID van 📅 Vergaderingen (niet geheim; net als de ID's in notion.js).
+const VERGADERINGEN_DS_ID = 'c255c2d1-f12f-4be0-93cd-905f62521de9';
 
 // Prioriteit uit de app (hoog/normaal/laag) -> Inbox-select (Hoog|Normaal).
 function inboxPrioriteit(prio) {
@@ -131,28 +137,58 @@ function normalizeDate(value) {
   return null;
 }
 
-// Ruw transcript in paragraafblokken van ~1900 tekens (rich_text-limiet = 2000).
+// Vandaag als YYYY-MM-DD (UTC — dicht genoeg bij BE-datum voor een capture).
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// Tekst opknippen in stukken van ~1900 tekens (rich_text-limiet = 2000).
+function chunk1900(text) {
+  const t = String(text || '').trim();
+  const out = [];
+  for (let i = 0; i < t.length; i += 1900) out.push(t.slice(i, i + 1900));
+  return out;
+}
+
+// Ruw transcript in paragraafblokken.
 function transcriptBlocks(transcript) {
-  const text = String(transcript || '').trim();
-  if (!text) return [];
-  const chunks = [];
-  for (let i = 0; i < text.length; i += 1900) {
-    chunks.push(text.slice(i, i + 1900));
-  }
-  // Notion staat max 100 blokken per create-call toe.
-  return chunks.slice(0, 100).map((chunk) => ({
+  return chunk1900(transcript).slice(0, 90).map((c) => ({
     object: 'block',
     type: 'paragraph',
-    paragraph: { rich_text: [{ type: 'text', text: { content: chunk } }] },
+    paragraph: { rich_text: [{ type: 'text', text: { content: c } }] },
   }));
 }
 
-async function createInboxPage(env, properties, children) {
+function headingBlock(text) {
+  return {
+    object: 'block',
+    type: 'heading_2',
+    heading_2: { rich_text: [{ type: 'text', text: { content: text } }] },
+  };
+}
+
+function paragraphBlock(text) {
+  return {
+    object: 'block',
+    type: 'paragraph',
+    paragraph: { rich_text: [{ type: 'text', text: { content: String(text || '').slice(0, 1900) } }] },
+  };
+}
+
+function bulletBlock(text) {
+  return {
+    object: 'block',
+    type: 'bulleted_list_item',
+    bulleted_list_item: { rich_text: [{ type: 'text', text: { content: String(text || '').slice(0, 1900) } }] },
+  };
+}
+
+async function createPage(env, dataSourceId, properties, children) {
   const payload = {
-    parent: { type: 'data_source_id', data_source_id: env.NOTION_INBOX_DS_ID },
+    parent: { type: 'data_source_id', data_source_id: dataSourceId },
     properties,
   };
-  if (children && children.length) payload.children = children;
+  if (children && children.length) payload.children = children.slice(0, 100);
 
   const resp = await fetch('https://api.notion.com/v1/pages', {
     method: 'POST',
@@ -170,10 +206,53 @@ async function createInboxPage(env, properties, children) {
   return resp.json().catch(() => ({}));
 }
 
+// Maakt een record in 📅 Vergaderingen met samenvatting, beslissingen en ruw
+// verslag in de body. Geeft het paginaobject terug (met .id) of null bij fout.
+async function createMeeting(env, result, transcript) {
+  const v = (result && result.vergadering) || {};
+  const samenvatting = result && result.samenvatting ? String(result.samenvatting) : '';
+  const beslissingen = Array.isArray(v.beslissingen) ? v.beslissingen.filter(Boolean) : [];
+  const aanwezigen = Array.isArray(v.aanwezigen) ? v.aanwezigen.filter(Boolean).join(', ') : String(v.aanwezigen || '');
+  const datum = normalizeDate(v.datum) || today();
+  const titel = (v.titel && String(v.titel).trim())
+    || (samenvatting ? samenvatting.slice(0, 60) : `Vergadering ${datum}`);
+
+  const properties = {
+    'Titel': { title: [{ text: { content: String(titel).slice(0, 200) } }] },
+    'Status': selectProp('Gehouden'),
+    'Datum': { date: { start: datum } },
+  };
+  if (aanwezigen) properties['Aanwezigen'] = richText(aanwezigen);
+  if (v.locatie) properties['Locatie'] = richText(v.locatie);
+
+  const children = [];
+  if (samenvatting) {
+    children.push(headingBlock('📝 Samenvatting'));
+    children.push(paragraphBlock(samenvatting));
+  }
+  if (beslissingen.length) {
+    children.push(headingBlock('✅ Beslissingen'));
+    beslissingen.forEach((b) => children.push(bulletBlock(b)));
+  }
+  children.push(headingBlock('📌 Acties'));
+  children.push(paragraphBlock('De actiepunten van deze vergadering staan in de Inbox (status "Te bevestigen") en verschijnen na bevestiging bij "Actiepunten".'));
+  if (String(transcript || '').trim()) {
+    children.push(headingBlock('🎙 Ruw transcript'));
+    transcriptBlocks(transcript).forEach((b) => children.push(b));
+  }
+
+  try {
+    return await createPage(env, VERGADERINGEN_DS_ID, properties, children);
+  } catch (e) {
+    console.error('[vergadering] record aanmaken mislukt:', e.message);
+    return null;
+  }
+}
+
 // Schrijft elk actiepunt als losse Inbox-rij op status "Te bevestigen".
 // Blokkeert de gebruiker nooit: fouten worden serverside gelogd, niet naar de
-// frontend teruggegeven. De aanroeper geeft 'result' altijd terug.
-async function writeToInbox(env, result, mode, transcript, captureId) {
+// frontend teruggegeven. meetingId (optioneel) koppelt de rij aan een vergadering.
+async function writeToInbox(env, result, mode, transcript, captureId, meetingId) {
   if (!env.NOTION_TOKEN || !env.NOTION_INBOX_DS_ID) {
     console.error('[inbox] NOTION_TOKEN of NOTION_INBOX_DS_ID ontbreekt - inbox-write overgeslagen.');
     return;
@@ -182,21 +261,29 @@ async function writeToInbox(env, result, mode, transcript, captureId) {
   const samenvatting = result && result.samenvatting ? String(result.samenvatting) : '';
   const reden = result && result.reden ? String(result.reden) : '';
   const actiepunten = Array.isArray(result && result.actiepunten) ? result.actiepunten : [];
+  const isMeeting = mode === 'vergadering';
 
   // Context die op elke rij mee gaat, zodat triage zonder de opname kan.
-  const gemeenschappelijk = () => ({
-    'Status': selectProp(INBOX_STATUS),
-    'Modus': selectProp(inboxModus(mode)),
-    'Reden': richText(reden),
-    'Samenvatting': richText(samenvatting),
-    'Capture-ID': richText(captureId),
-  });
+  const gemeenschappelijk = () => {
+    const props = {
+      'Status': selectProp(INBOX_STATUS),
+      'Modus': selectProp(inboxModus(mode)),
+      'Reden': richText(reden),
+      'Samenvatting': richText(samenvatting),
+      'Capture-ID': richText(captureId),
+    };
+    if (meetingId) props['Vergadering'] = { relation: [{ id: meetingId }] };
+    return props;
+  };
 
-  // Ruw transcript enkel bij de eerste gemaakte rij, om duplicatie te beperken.
-  const body = transcriptBlocks(transcript);
+  // Ruw transcript enkel bij een notitie in de eerste Inbox-rij; bij een
+  // vergadering staat het volledige verslag al in het Vergaderingen-record.
+  const body = isMeeting ? [] : transcriptBlocks(transcript);
   let transcriptGeplaatst = false;
 
   if (actiepunten.length === 0) {
+    // Bij een vergadering zonder acties is het Vergaderingen-record al de vastlegging.
+    if (isMeeting) return;
     // Geen actiepunten => een Notitie-rij met de samenvatting als titel.
     const properties = {
       ...gemeenschappelijk(),
@@ -204,7 +291,7 @@ async function writeToInbox(env, result, mode, transcript, captureId) {
       'Type': selectProp('Notitie'),
     };
     try {
-      await createInboxPage(env, properties, body);
+      await createPage(env, env.NOTION_INBOX_DS_ID, properties, body);
     } catch (e) {
       console.error('[inbox] notitie-rij mislukt:', e.message);
     }
@@ -230,7 +317,7 @@ async function writeToInbox(env, result, mode, transcript, captureId) {
 
     const children = transcriptGeplaatst ? [] : body;
     try {
-      await createInboxPage(env, properties, children);
+      await createPage(env, env.NOTION_INBOX_DS_ID, properties, children);
       transcriptGeplaatst = true;
     } catch (e) {
       console.error(`[inbox] actiepunt-rij ${i} mislukt:`, e.message);
@@ -304,13 +391,18 @@ export async function onRequestPost(context) {
   // ongeacht wat het model invulde. notitie => acties, vergadering => verslag.
   result.mode = mode === 'vergadering' ? 'verslag' : 'acties';
 
-  // Notion Inbox-write: draait NA de classificatie en mag de gebruiker nooit
-  // blokkeren. Fouten worden serverside gelogd; 'result' gaat altijd terug.
+  // Notion-write: draait NA de classificatie en mag de gebruiker nooit blokkeren.
+  // Fouten worden serverside gelogd; 'result' gaat altijd terug.
   try {
     const captureId = crypto.randomUUID();
-    await writeToInbox(env, result, mode, transcript, captureId);
+    let meetingId = null;
+    if (mode === 'vergadering' && env.NOTION_TOKEN) {
+      const meeting = await createMeeting(env, result, transcript);
+      meetingId = meeting && meeting.id ? meeting.id : null;
+    }
+    await writeToInbox(env, result, mode, transcript, captureId, meetingId);
   } catch (e) {
-    console.error('[inbox] onverwachte fout:', e && e.message);
+    console.error('[notion] onverwachte fout:', e && e.message);
   }
 
   return json({ result });

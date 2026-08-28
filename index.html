@@ -426,7 +426,7 @@ Gebruik voor korte notities of tijdens een vergadering.</div>
   </div>
   <div class="sheet-footer" id="sheetFooter" style="display:none">
     <button class="copy-btn" onclick="copyOutput()">📋 Kopieer</button>
-    <button class="notion-btn" id="notionBtn" onclick="sendToNotion()">📌 Naar Notion</button>
+    <button class="notion-btn" id="doneBtn" onclick="closeSheet()">✓ Klaar</button>
   </div>
 </div>
 
@@ -626,6 +626,12 @@ function clearTranscript() {
 }
 
 // ── Send to Claude ──
+// Vuurt de opname af en laat 'm serverside afwerken. Met keepalive loopt de
+// verwerking door ook als je dit scherm sluit of je telefoon vergrendelt — je
+// hoeft dus niet te blijven wachten. De server schrijft alles automatisch naar
+// je Notion-Inbox (en bij een vergadering ook naar 📅 Vergaderingen).
+let lastCaptured = false;
+
 async function sendToClaude() {
   const text = finalTranscript.trim();
   if (!text) return;
@@ -633,13 +639,18 @@ async function sendToClaude() {
   openSheet();
   setSheetLoading();
 
+  // De API-sleutel en het model zitten veilig serverside — nooit in deze pagina.
+  const payload = JSON.stringify({ transcript: text, mode: currentMode });
+  // keepalive heeft een body-limiet (~64 KB); enkel gebruiken bij kortere opnames,
+  // zodat een heel lange vergadering niet stilletjes geweigerd wordt.
+  const useKeepalive = payload.length < 60000;
+
   try {
-    // Roept de eigen serverside proxy aan (Cloudflare Pages Function).
-    // De API-sleutel en het model zitten veilig serverside — nooit in deze pagina.
     const resp = await fetch('/api/process', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript: text, mode: currentMode })
+      body: payload,
+      keepalive: useKeepalive,
     });
 
     let data = {};
@@ -651,6 +662,7 @@ async function sendToClaude() {
     }
 
     resultData = data.result;
+    lastCaptured = true;
     renderResult(resultData);
 
   } catch(e) {
@@ -667,6 +679,8 @@ function openSheet() {
 function closeSheet() {
   document.getElementById('sheetOverlay').classList.remove('open');
   document.getElementById('resultSheet').classList.remove('open');
+  // Na een geslaagde verwerking het transcript leegmaken voor een schone start.
+  if (lastCaptured) { lastCaptured = false; clearTranscript(); }
 }
 
 function setSheetLoading() {
@@ -677,7 +691,7 @@ function setSheetLoading() {
   document.getElementById('sheetBody').innerHTML = `
     <div class="loading-state">
       <div class="spinner"></div>
-      <div class="loading-text">Claude verwerkt je opname…</div>
+      <div class="loading-text">Claude verwerkt je opname…<br><span style="font-size:12px;color:var(--muted)">Je mag dit scherm sluiten — het wordt bewaard in je Notion-Inbox.</span></div>
     </div>`;
 }
 
@@ -696,7 +710,13 @@ function renderResult(r) {
   badge.className = 'sheet-type-badge ' + (r.mode === 'verslag' ? 'badge-verslag' : 'badge-acties');
   subtitle.textContent = r.reden;
 
-  let html = `<div class="result-summary">${escHtml(r.samenvatting)}</div>`;
+  // Bevestiging: alles is al automatisch bewaard — geen keuzes nodig op dit scherm.
+  const bewaardTekst = r.mode === 'verslag'
+    ? 'Opgeslagen: verslag in 📅 Vergaderingen, acties in je Inbox.'
+    : 'Opgeslagen in je Notion-Inbox (status “Te bevestigen”).';
+  let html = `<div style="display:flex;gap:8px;align-items:center;background:#EEF8F0;border:1px solid #CDE9D6;color:var(--success);padding:10px 12px;border-radius:10px;font-size:13px;font-weight:600;margin-bottom:14px">✓ <span>${bewaardTekst}</span></div>`;
+
+  html += `<div class="result-summary">${escHtml(r.samenvatting || '')}</div>`;
 
   if (r.vergadering?.beslissingen?.length > 0) {
     html += `<div style="margin-bottom:14px">
@@ -708,29 +728,18 @@ function renderResult(r) {
   }
 
   if (r.actiepunten?.length > 0) {
-    html += `<div class="project-picker">
-      <label for="projectSelect">Project (voor Notion)</label>
-      <select id="projectSelect" class="project-select">
-        <option value="">— Geen project —</option>
-      </select>
-    </div>`;
-
-    html += `<div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:10px">Actiepunten (${r.actiepunten.length}) · tik om te (de)selecteren</div>
+    html += `<div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:10px">Actiepunten (${r.actiepunten.length})</div>
     <div class="acties-list">`;
 
-    r.actiepunten.forEach((a, i) => {
-      if (typeof a._selected === 'undefined') {
-        a._selected = (a.houder || 'Yannick').toLowerCase().includes('yannick');
-      }
-      html += `<div class="actie-item ${a._selected ? 'selected' : ''}" id="actie_${i}" onclick="toggleActie(${i})">
-        <div class="actie-desc"><span class="actie-check">✓</span>${escHtml(a.omschrijving)}</div>
+    r.actiepunten.forEach((a) => {
+      html += `<div class="actie-item">
+        <div class="actie-desc">${escHtml(a.omschrijving)}</div>
         <div class="actie-meta">
           <span class="actie-chip">${escHtml(a.houder || 'Yannick')}</span>
           ${a.prioriteit === 'hoog' ? '<span class="actie-chip" style="background:#FEE2E2;color:#B91C1C">⚡ hoog</span>' : ''}
           ${a.deadline ? `<span class="actie-chip deadline">📅 ${escHtml(a.deadline)}</span>` : ''}
+          ${a.project ? `<span class="actie-chip" style="background:#EEF2FB;color:var(--brand)">🗂 ${escHtml(a.project)}</span>` : ''}
         </div>
-        ${!a.deadline ? `<input class="deadline-input" type="date" onclick="event.stopPropagation()"
-          onchange="updateDeadline(${i}, this.value)" value="">` : ''}
       </div>`;
     });
     html += '</div>';
@@ -738,15 +747,6 @@ function renderResult(r) {
 
   document.getElementById('sheetBody').innerHTML = html;
   document.getElementById('sheetFooter').style.display = 'flex';
-
-  // Notion-knop enkel tonen als er actiepunten zijn; projecten laden voor de dropdown
-  const notionBtn = document.getElementById('notionBtn');
-  if (r.actiepunten?.length > 0) {
-    if (notionBtn) notionBtn.style.display = 'flex';
-    loadProjecten();
-  } else if (notionBtn) {
-    notionBtn.style.display = 'none';
-  }
 }
 
 function updateDeadline(i, val) {
@@ -769,31 +769,9 @@ function selectedActies() {
   return resultData.actiepunten.filter(a => a._selected);
 }
 
-// ── Projecten ophalen voor de dropdown ──
-async function loadProjecten() {
-  const sel = document.getElementById('projectSelect');
-  if (!sel) return;
-  try {
-    const resp = await fetch('/api/notion');
-    const data = await resp.json();
-    if (!resp.ok || data.error) throw new Error(data.error || resp.status);
-    (data.projecten || []).forEach(p => {
-      const opt = document.createElement('option');
-      opt.value = p.id;
-      opt.textContent = p.code ? `${p.naam} (${p.code})` : p.naam;
-      sel.appendChild(opt);
-    });
-  } catch (e) {
-    const opt = document.createElement('option');
-    opt.textContent = '⚠️ Projecten laden mislukt';
-    opt.disabled = true;
-    sel.appendChild(opt);
-  }
-}
-
 // ── Output ──
 function buildActiesText() {
-  return selectedActies().map(a => {
+  return (resultData?.actiepunten || []).map(a => {
     let line = `- ${a.omschrijving}`;
     if (a.deadline) line += ` (deadline ${a.deadline})`;
     return line;
@@ -803,45 +781,6 @@ function buildActiesText() {
 function copyOutput() {
   const text = buildActiesText() || resultData?.samenvatting || '';
   navigator.clipboard.writeText(text).then(() => showToast('Gekopieerd!'));
-}
-
-// ── Wegschrijven naar Notion ──
-async function sendToNotion() {
-  const acties = selectedActies();
-  if (acties.length === 0) { showToast('Geen actiepunten geselecteerd'); return; }
-
-  const sel = document.getElementById('projectSelect');
-  const project = sel ? sel.value : '';
-  const btn = document.getElementById('notionBtn');
-  const origLabel = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Bezig…'; }
-
-  try {
-    const resp = await fetch('/api/notion', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        project,
-        actiepunten: acties.map(a => ({
-          omschrijving: a.omschrijving,
-          deadline: a.deadline || null,
-          prioriteit: a.prioriteit || 'normaal',
-        })),
-      }),
-    });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok || data.error) {
-      showToast(data.error || `Notion-fout (${resp.status})`);
-      if (btn) { btn.disabled = false; btn.innerHTML = origLabel; }
-      return;
-    }
-    const extra = data.failed ? ` (${data.failed} mislukt)` : '';
-    showToast(`✅ ${data.created} taak/taken in Notion${extra}`);
-    closeSheet();
-  } catch (e) {
-    showToast('Kon Notion niet bereiken: ' + e.message);
-    if (btn) { btn.disabled = false; btn.innerHTML = origLabel; }
-  }
 }
 
 // ── Toast ──
