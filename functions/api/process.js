@@ -9,16 +9,25 @@ const MODEL = 'claude-sonnet-5';   // geldig, actueel model-ID (datumloos = vast
 const MAX_TOKENS = 2000;           // ruim genoeg voor een lang vergaderverslag
 
 // ── Actieve projecten (stuurt de projectgok van Claude) ──
-// Vul hier je actieve projectnamen in; Claude kiest bij voorkeur een van deze
-// exacte namen voor 'project' als er een past, anders zijn beste vrije gok of null.
-const ACTIEVE_PROJECTEN = [
-  // 'Woonproject Aarschot',
-  // 'VMSW Diest',
-];
+// De projectnamen worden LIVE uit Notion (🗂 Projecten) gehaald zodat Claude zijn
+// 'project'-gok kiest uit de ECHTE lijst; de latere promotie (naam -> page-ID) wordt
+// dan een simpele match. Zie fetchProjectNamen() in de Notion-sectie hieronder.
+// Lukt de ophaling niet, dan valt alles terug op een vrije gok (zoals vroeger).
 
-const PROJECT_HINT = ACTIEVE_PROJECTEN.length
-  ? `\n\nActieve projecten (kies bij 'project' bij voorkeur een van deze exacte namen als die past; anders je beste vrije gok of null):\n- ${ACTIEVE_PROJECTEN.join('\n- ')}`
-  : '';
+// Lichte cache: hergebruik de opgehaalde namen ~15 min, zodat niet elke opname een
+// Notion-call kost. Module-scope; best-effort (leeg bij een cold start).
+let projectenCache = { namen: [], ts: 0 };
+const PROJECTEN_TTL_MS = 15 * 60 * 1000;
+
+// Bouwt de injectie-instructie uit de opgehaalde projectnamen. Lege lijst => ''
+// (dan geen injectie; Claude vult 'project' als vrije gok in, zoals vandaag).
+function projectHint(namen) {
+  if (!namen || !namen.length) return '';
+  return `\n\nDit zijn de actieve projecten: ${namen.join(', ')}. `
+    + `Kies voor elk actiepunt het meest waarschijnlijke project EXACT zoals het in deze `
+    + `lijst staat en zet het in het veld 'project'. Past geen enkel project duidelijk, laat `
+    + `'project' dan leeg. Verzin nooit een projectnaam die niet in de lijst staat.`;
+}
 
 const SYSTEM_PROMPT = `Je bent een assistent voor Yannick, solo BIM-consultant bij Consulens.
 Je analyseert gesproken Nederlandse tekst (transcripties) en maakt er een gestructureerd verslag of actielijst van.
@@ -325,6 +334,55 @@ async function writeToInbox(env, result, mode, transcript, captureId, meetingId)
   }
 }
 
+// Haalt de actieve projectnamen op uit 🗂 Projecten (data source
+// NOTION_PROJECTS_DS_ID). Leest per resultaat de property van het TYPE 'title'
+// (zoekt op type === 'title', gaat NIET uit van een vaste propertynaam) en geeft
+// een array namen (strings) terug. Ontbreekt de env var of faalt de call => lege
+// array + log. Dit mag de verwerking NOOIT blokkeren. Cachet ~15 min (zie boven).
+async function fetchProjectNamen(env) {
+  if (!env.NOTION_TOKEN || !env.NOTION_PROJECTS_DS_ID) {
+    console.error('[projecten] NOTION_TOKEN of NOTION_PROJECTS_DS_ID ontbreekt - projectlijst overgeslagen.');
+    return [];
+  }
+
+  // Cache: binnen de TTL hergebruiken zonder nieuwe Notion-call.
+  if (projectenCache.namen.length && (Date.now() - projectenCache.ts) < PROJECTEN_TTL_MS) {
+    return projectenCache.namen;
+  }
+
+  try {
+    const resp = await fetch(`https://api.notion.com/v1/data_sources/${env.NOTION_PROJECTS_DS_ID}/query`, {
+      method: 'POST',
+      headers: {
+        'authorization': `Bearer ${env.NOTION_TOKEN}`,
+        'notion-version': NOTION_VERSION,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ page_size: 100 }),
+    });
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => '');
+      throw new Error(`Notion ${resp.status}: ${detail}`);
+    }
+    const data = await resp.json();
+    const namen = [];
+    for (const page of (data.results || [])) {
+      const props = (page && page.properties) || {};
+      // Zoek de title-property op TYPE (de naam kan per workspace afwijken).
+      const titleProp = Object.values(props).find((prop) => prop && prop.type === 'title');
+      const naam = titleProp && Array.isArray(titleProp.title)
+        ? titleProp.title.map((t) => (t && t.plain_text) || '').join('').trim()
+        : '';
+      if (naam) namen.push(naam);
+    }
+    projectenCache = { namen, ts: Date.now() };
+    return namen;
+  } catch (e) {
+    console.error('[projecten] ophalen mislukt:', e.message);
+    return [];
+  }
+}
+
 export async function onRequestPost(context) {
   const { request, env } = context;
 
@@ -346,6 +404,11 @@ export async function onRequestPost(context) {
     return json({ error: 'Geen transcript ontvangen.' }, 400);
   }
 
+  // Actieve projectnamen ophalen (best-effort) en in de classificatieprompt injecteren.
+  // Faalt dit, dan is de lijst leeg en raadt Claude 'project' vrij, zoals vroeger.
+  const projectNamen = await fetchProjectNamen(env);
+  const systemPrompt = SYSTEM_PROMPT + projectHint(projectNamen);
+
   let resp;
   try {
     resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -358,7 +421,7 @@ export async function onRequestPost(context) {
       body: JSON.stringify({
         model: MODEL,
         max_tokens: MAX_TOKENS,
-        system: SYSTEM_PROMPT + PROJECT_HINT,
+        system: systemPrompt,
         messages: [
           { role: 'user', content: `Modus: ${mode}\n\nTranscript:\n${transcript}` },
         ],
