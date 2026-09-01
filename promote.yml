@@ -1,0 +1,21 @@
+name: Promoot Inbox naar Taken
+
+# Zet bevestigde Inbox-actiepunten automatisch om in taken in ✅ Taken.
+# Draait elke 30 minuten en kan handmatig gestart worden (Actions-tab → Run workflow).
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Promoveer bevestigde Inbox-rijen
+        run: node scripts/promote-inbox.mjs
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}

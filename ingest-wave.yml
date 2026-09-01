@@ -1,0 +1,23 @@
+name: Ingest Wave naar Inbox
+
+# Haalt nieuwe Wave-sessies op en zet ze als pagina's in de Consulens Voice — Inbox.
+# Draait elke 15 minuten en kan handmatig gestart worden (Actions-tab → Run workflow).
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Ingest Wave-sessies naar de Inbox
+        run: node scripts/ingest-wave.mjs
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          WAVE_API_TOKEN: ${{ secrets.WAVE_API_TOKEN }}
